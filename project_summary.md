@@ -14,6 +14,8 @@
     cwe2capec.py
     capec2technique.py
     update_capec_db.py
+    cpe_index.py
+    rebuild_db.py
     technique2defend.py
 docs/
     css/
@@ -128,7 +130,6 @@ INCLUDE_DIRS: Set[str] = {
 
 INCLUDE_EXTS: Set[str] = {
     ".py",
-
 }
 
 INCLUDE_FILES: Set[str] = {
@@ -514,7 +515,7 @@ Made with ❤️ in 🇫🇷 by <a href="https://galeax.com"><img src="https://g
 ```py
 import requests
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from tqdm import tqdm
 from re import match
 import os
@@ -528,9 +529,14 @@ API_KEY = os.environ.get("NVD_API_KEY")
 UPDATE_FILE = "lastUpdate.txt"
 CVE_FILE = "results/new_cves.jsonl"
 
+# NVD enforces a maximum 120-day window per request
+MAX_WINDOW_DAYS = 119
+
+
 def format_nvd_timestamp(dt: datetime) -> str:
     dt_utc = dt.astimezone(timezone.utc)
     return dt_utc.strftime('%Y-%m-%dT%H:%M:%S.000+00:00')
+
 
 def fetch_data_with_retries(session, url, params=None, retries=3, delay=5):
     for attempt in range(1, retries + 1):
@@ -544,14 +550,76 @@ def fetch_data_with_retries(session, url, params=None, retries=3, delay=5):
             raise Exception(f"Failed to download CVE data after {retries} attempts (status code: {response.status_code})")
     raise Exception(f"Failed to download CVE data after {retries} attempts (status code: {response.status_code})")
 
-def parse_cves(start_date: str, end_date: str):
-    cve_data = {}
-    session = requests.Session()
-    session.headers.update({"apiKey": API_KEY})
 
+def parse_cpe_string(cpe: str) -> dict | None:
+    """
+    Parse a CPE 2.3 string into vendor, product, version components.
+    Format: cpe:2.3:part:vendor:product:version:...
+    Returns None if the string is not a valid CPE 2.3 entry.
+    """
+    parts = cpe.split(":")
+    if len(parts) < 6 or parts[0] != "cpe" or parts[1] != "2.3":
+        return None
+    vendor = parts[3]
+    product = parts[4]
+    version = parts[5]
+    if vendor == "*" or product == "*":
+        return None
+    return {
+        "vendor": vendor,
+        "product": product,
+        "version": version if version not in ("*", "-", "") else "N/A"
+    }
+
+
+def extract_cpe_entries(configurations: list) -> list[dict]:
+    """
+    Walk the configurations block from NVD and collect unique
+    vendor/product/version triples marked as vulnerable.
+    """
+    seen = set()
+    results = []
+    for node in configurations:
+        nodes_to_visit = [node]
+        while nodes_to_visit:
+            current = nodes_to_visit.pop()
+            for cpe_match in current.get("cpeMatch", []):
+                if not cpe_match.get("vulnerable", False):
+                    continue
+                parsed = parse_cpe_string(cpe_match.get("criteria", ""))
+                if parsed:
+                    key = (parsed["vendor"], parsed["product"], parsed["version"])
+                    if key not in seen:
+                        seen.add(key)
+                        results.append(parsed)
+            for child in current.get("nodes", []):
+                nodes_to_visit.append(child)
+    return results
+
+
+def build_date_chunks(start_dt: datetime, end_dt: datetime) -> list[tuple[datetime, datetime]]:
+    """
+    Split a date range into MAX_WINDOW_DAYS-day chunks.
+    Returns a list of (chunk_start, chunk_end) datetime pairs.
+    """
+    chunks = []
+    cursor = start_dt
+    while cursor < end_dt:
+        chunk_end = min(cursor + timedelta(days=MAX_WINDOW_DAYS), end_dt)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end + timedelta(seconds=1)
+    return chunks
+
+
+def fetch_chunk(session, start_dt: datetime, end_dt: datetime) -> dict:
+    """
+    Fetch all CVEs within a single date window (<= 120 days).
+    Returns a dict of {cve_id: data}.
+    """
+    cve_data = {}
     params = {
-        "lastModStartDate": start_date,
-        "lastModEndDate": end_date,
+        "lastModStartDate": format_nvd_timestamp(start_dt),
+        "lastModEndDate": format_nvd_timestamp(end_dt),
         "resultsPerPage": 2000,
         "startIndex": 0,
     }
@@ -562,20 +630,25 @@ def parse_cves(start_date: str, end_date: str):
     total_results = cves.get("totalResults", 0)
 
     if results_per_page == 0 or total_results == 0:
-        print("[-] No new vulnerabilities found")
         return cve_data
 
     nb_pages = (total_results + results_per_page - 1) // results_per_page
 
-    for page in tqdm(range(nb_pages), desc="Fetching pages", unit="Page"):
-        params["startIndex"] = page * 2000
-        response = fetch_data_with_retries(session, API_CVES, params)
-        cves = response.json()
-        for cve in tqdm(cves.get("vulnerabilities", []), desc="Processing CVEs", unit="CVE"):
+    for page in tqdm(range(nb_pages), desc="  Pages", unit="page", leave=False):
+        if page > 0:
+            params["startIndex"] = page * 2000
+            response = fetch_data_with_retries(session, API_CVES, params)
+            cves = response.json()
+            time.sleep(1)  # be polite between paginated requests
+
+        for cve in cves.get("vulnerabilities", []):
+            cve_body = cve.get("cve", {})
+            cve_id = cve_body.get("id", "")
+
+            # --- CWE ---
             has_primary_cwe = False
-            cve_id = cve.get("cve", {}).get("id", "")
             cwe_list = []
-            infos = cve.get("cve", {}).get("weaknesses", [])
+            infos = cve_body.get("weaknesses", [])
             if infos:
                 for cwe in infos:
                     if cwe.get("type", "") == "Primary":
@@ -589,12 +662,81 @@ def parse_cves(start_date: str, end_date: str):
                             cwe_code = cwe.get("description", [])[0].get("value", "")
                             if match(r"CWE-\d{1,4}", cwe_code):
                                 cwe_list.append(cwe_code.split("-")[1])
-                cve_data[cve_id] = {"CWE": cwe_list}
-            else:
-                cve_data[cve_id] = {"CWE": []}
+
+            # --- Metadata ---
+            published = cve_body.get("published", "")
+            last_modified = cve_body.get("lastModified", "")
+
+            description = ""
+            for desc in cve_body.get("descriptions", []):
+                if desc.get("lang") == "en":
+                    description = desc.get("value", "")
+                    break
+
+            # CVSS: prefer v3.1, fall back to v3.0 then v2.0
+            cvss_score = None
+            cvss_severity = None
+            metrics = cve_body.get("metrics", {})
+            for metric_key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                metric_list = metrics.get(metric_key, [])
+                if metric_list:
+                    cvss_data = metric_list[0].get("cvssData", {})
+                    cvss_score = cvss_data.get("baseScore")
+                    cvss_severity = (
+                        metric_list[0].get("baseSeverity")
+                        or cvss_data.get("baseSeverity")
+                    )
+                    break
+
+            # --- CPE ---
+            configurations = cve_body.get("configurations", [])
+            cpe_entries = extract_cpe_entries(configurations)
+
+            cve_data[cve_id] = {
+                "published": published,
+                "lastModified": last_modified,
+                "description": description,
+                "cvssScore": cvss_score,
+                "cvsseSeverity": cvss_severity,
+                "CWE": cwe_list,
+                "CPE": cpe_entries,
+            }
+
     return cve_data
 
-def save_jsonl(cve_data, today_iso: str):
+
+def parse_cves(start_dt: datetime, end_dt: datetime) -> dict:
+    """
+    Fetch all CVEs between start_dt and end_dt, automatically chunking
+    into MAX_WINDOW_DAYS-day windows to satisfy the NVD API limit.
+    """
+    session = requests.Session()
+    if API_KEY:
+        session.headers.update({"apiKey": API_KEY})
+
+    chunks = build_date_chunks(start_dt, end_dt)
+    all_cve_data = {}
+
+    print(f"[!] Fetching CVEs from {format_nvd_timestamp(start_dt)} → {format_nvd_timestamp(end_dt)}")
+    print(f"[!] {len(chunks)} chunk(s) of up to {MAX_WINDOW_DAYS} days each\n")
+
+    for i, (chunk_start, chunk_end) in enumerate(chunks, 1):
+        print(f"[>] Chunk {i}/{len(chunks)}: {format_nvd_timestamp(chunk_start)} → {format_nvd_timestamp(chunk_end)}")
+        try:
+            chunk_data = fetch_chunk(session, chunk_start, chunk_end)
+            all_cve_data.update(chunk_data)
+            print(f"    +{len(chunk_data)} CVEs  |  running total: {len(all_cve_data)}")
+        except Exception as e:
+            print(f"[-] Chunk {i} failed: {e} — skipping")
+
+        # Stay within NVD rate limits: 50 req/30s with key, 5 req/30s without
+        if i < len(chunks):
+            time.sleep(2 if API_KEY else 8)
+
+    return all_cve_data
+
+
+def save_jsonl(cve_data: dict, today_iso: str):
     os.makedirs(os.path.dirname(CVE_FILE), exist_ok=True)
     with open(CVE_FILE, 'w', encoding='utf-8') as f:
         for cve, data in cve_data.items():
@@ -603,24 +745,25 @@ def save_jsonl(cve_data, today_iso: str):
     with open(UPDATE_FILE, 'w', encoding='utf-8') as f:
         f.write(today_iso)
 
+
 if __name__ == "__main__":
     today_dt = datetime.now(timezone.utc)
-    today = format_nvd_timestamp(today_dt)
 
     try:
         with open(UPDATE_FILE, 'r') as f:
             last_update_raw = f.read().strip()
         last_update_dt = datetime.fromisoformat(last_update_raw)
-        last_update = format_nvd_timestamp(last_update_dt)
     except Exception as e:
         print(f"[!] Failed to parse last update date: {e}. Using fallback date.")
         last_update_dt = datetime(2021, 1, 1, tzinfo=timezone.utc)
-        last_update = format_nvd_timestamp(last_update_dt)
 
-    cves_data = parse_cves(last_update, today)
-    save_jsonl(cves_data, today_dt.isoformat())
+    cves_data = parse_cves(last_update_dt, today_dt)
 
-
+    if cves_data:
+        save_jsonl(cves_data, today_dt.isoformat())
+        print(f"\n[+] Saved {len(cves_data)} CVEs to {CVE_FILE}")
+    else:
+        print("[-] No new vulnerabilities found")
 ```
 
 ## File: update_technique_db.py
@@ -630,41 +773,98 @@ import json
 import pandas as panda
 
 TECHNIQUES_ENTERPRISE_FILE_URL = "https://attack.mitre.org/docs/attack-excel-files/v19.0/enterprise-attack/enterprise-attack-v19.0-techniques.xlsx"
-ENTERPRISE_XSLX_CASE = 9
 TECHNIQUES_MOBILE_FILE_URL = "https://attack.mitre.org/docs/attack-excel-files/v19.0/mobile-attack/mobile-attack-v19.0-techniques.xlsx"
-MOBILE_XSLX_CASE = 10
 TECHNIQUES_ICS_FILE_URL = "https://attack.mitre.org/docs/attack-excel-files/v19.0/ics-attack/ics-attack-v19.0-techniques.xlsx"
-ICS_XSLX_CASE = 9
 TECHNIQUES_FILE = "resources/techniques_db.json"
 
-# Download the techniques data
-def download_techniques(base_url, case):
+# Column indices within each ATT&CK Excel file:
+#   Enterprise : col 0 = ID,  col 9  = CAPEC mappings, col 4 = tactic
+#   Mobile     : col 0 = ID,  col 10 = CAPEC mappings, col 4 = tactic
+#   ICS        : col 0 = ID,  col 9  = CAPEC mappings, col 4 = tactic
+#
+# The tactic column contains a comma-separated list of tactic short-names
+# (e.g. "execution, persistence").  We keep all of them.
+
+DOMAIN_CONFIG = {
+    "enterprise": {
+        "url": TECHNIQUES_ENTERPRISE_FILE_URL,
+        "capec_col": 9,
+        "tactic_col": 4,
+    },
+    "mobile": {
+        "url": TECHNIQUES_MOBILE_FILE_URL,
+        "capec_col": 10,
+        "tactic_col": 4,
+    },
+    "ics": {
+        "url": TECHNIQUES_ICS_FILE_URL,
+        "capec_col": 9,
+        "tactic_col": 4,
+    },
+}
+
+
+def download_techniques(url: str, capec_col: int, tactic_col: int) -> dict | None:
+    """
+    Download an ATT&CK techniques Excel file and return a dict keyed by
+    technique ID.  Each value is:
+        {
+            "capec": ["CAPEC-ID", ...],   # split from the mapped column
+            "tactics": ["tactic-name", ...]
+        }
+    Raw file is never written to disk.
+    """
     try:
-        data = panda.read_excel(base_url)
+        data = panda.read_excel(url)
         result = {}
-        for i in range(0, len(data)):
-            result[data.iloc[i, 0]] = data.iloc[i, case].split(", ")
+        for i in range(len(data)):
+            technique_id = data.iloc[i, 0]
+
+            # --- CAPEC mappings ---
+            raw_capec = data.iloc[i, capec_col]
+            if panda.isna(raw_capec) or str(raw_capec).strip() == "":
+                capec_list = []
+            else:
+                capec_list = [c.strip() for c in str(raw_capec).split(",") if c.strip()]
+
+            # --- Tactic(s) ---
+            raw_tactic = data.iloc[i, tactic_col]
+            if panda.isna(raw_tactic) or str(raw_tactic).strip() == "":
+                tactic_list = []
+            else:
+                tactic_list = [t.strip() for t in str(raw_tactic).split(",") if t.strip()]
+
+            result[technique_id] = {
+                "capec": capec_list,
+                "tactics": tactic_list,
+            }
         return result
     except Exception as e:
-        print(f"Error downloading the data: {str(e)}")
+        print(f"Error downloading the data from {url}: {str(e)}")
         return None
 
 
-# Save the techniques data to a JSON file
-def save_json(data):
+def save_json(data: dict):
     with open(TECHNIQUES_FILE, 'w') as f:
         json.dump(data, f, indent=4)
-    
+
 
 if __name__ == "__main__":
-    print("[!] Downloading techniques data...")
-    techniques_data = download_techniques(TECHNIQUES_ENTERPRISE_FILE_URL, ENTERPRISE_XSLX_CASE)
-    techniques_data.update(download_techniques(TECHNIQUES_MOBILE_FILE_URL, MOBILE_XSLX_CASE))
-    techniques_data.update(download_techniques(TECHNIQUES_ICS_FILE_URL, ICS_XSLX_CASE))
-    if techniques_data:
-        print("[!] Saving techniques data...")
-        save_json(techniques_data)
+    combined = {}
+    for domain, cfg in DOMAIN_CONFIG.items():
+        print(f"[!] Downloading {domain} techniques...")
+        result = download_techniques(cfg["url"], cfg["capec_col"], cfg["tactic_col"])
+        if result:
+            # Later domains overwrite earlier ones on ID clash — IDs are unique
+            # across domains so this is safe.
+            combined.update(result)
 
+    if combined:
+        print("[!] Saving techniques data...")
+        save_json(combined)
+        print(f"[+] {len(combined)} techniques saved to {TECHNIQUES_FILE}")
+    else:
+        print("[-] No technique data downloaded")
 ```
 
 ## File: cwe2capec.py
@@ -761,28 +961,24 @@ from tqdm import tqdm
 
 
 CAPEC_FILE = "resources/capec_db.json"
+TECHNIQUES_FILE = "resources/techniques_db.json"
 CVE_FILE = "results/new_cves.jsonl"
 
 
-# Update the database with the new CVEs and save the results to a JSONL file
-def save_jsonl(cve_capec_data):
-    
-    # Write the results to a JSONL file
+def save_jsonl(cve_capec_data: dict):
+    """Write results to new_cves.jsonl and update per-year database files."""
     with open(CVE_FILE, 'w') as f:
         for cve, data in cve_capec_data.items():
             f.write(json.dumps({cve: data}) + "\n")
 
     new_cves = {}
-
     for cve, data in cve_capec_data.items():
         year = cve.split('-')[1]
         if year not in new_cves:
             new_cves[year] = {}
         new_cves[year][cve] = data
 
-
     for year, cves in new_cves.items():
-        # Update the database with the new CVEs
         cve_db = load_db_jsonl(year)
         cve_db.update(cves)
         with open(f'database/CVE-{year}.jsonl', 'w') as f:
@@ -790,8 +986,7 @@ def save_jsonl(cve_capec_data):
                 f.write(json.dumps({cve: data}) + "\n")
 
 
-# Load the database from a JSONL file
-def load_db_jsonl(cve_year):
+def load_db_jsonl(cve_year: str) -> dict:
     cve_db = {}
     try:
         with open(f'database/CVE-{cve_year}.jsonl', 'r') as f:
@@ -803,36 +998,64 @@ def load_db_jsonl(cve_year):
     return cve_db
 
 
-# Process CVE to extract the related CAPEC entries
-def process_single_cve(cve, capec_list, cve_capec_data):
-    technics = set()
-    for capec in cve_capec_data[cve]["CAPEC"]:
-        lines = capec_list.get(capec, {}).get("techniques", "")
-        if lines:
-            entries = lines.split("NAME:ATTACK:ENTRY ")[1:]
-            for entry in entries:
-                infos = entry.split(":")
-                id = infos[1]
-                technics.add(id)
-    return list(sorted(technics))
+def process_single_cve(cve: str, capec_list: dict, techniques_db: dict, cve_capec_data: dict) -> list[dict]:
+    """
+    For a single CVE, resolve its CAPEC entries to ATT&CK techniques.
+    Returns a list of dicts:
+        [{"id": "T1059", "name": "...", "tactics": ["execution", ...]}, ...]
+    Deduplicates by technique ID.
+    """
+    seen_ids = set()
+    techniques = []
+
+    for capec_id in cve_capec_data[cve].get("CAPEC", []):
+        capec_entry = capec_list.get(capec_id, {})
+        raw_mappings = capec_entry.get("techniques", "")
+        if not raw_mappings:
+            continue
+
+        # The stored format is: "NAME:ATTACK:ENTRY <id>:<name>: ..."
+        entries = raw_mappings.split("NAME:ATTACK:ENTRY ")[1:]
+        for entry in entries:
+            infos = entry.split(":")
+            technique_id = infos[1] if len(infos) > 1 else ""
+            technique_name = infos[2].strip() if len(infos) > 2 else ""
+
+            if not technique_id or technique_id in seen_ids:
+                continue
+            seen_ids.add(technique_id)
+
+            # Pull tactic(s) from the techniques_db
+            tech_meta = techniques_db.get(technique_id, {})
+            tactics = tech_meta.get("tactics", [])
+
+            techniques.append({
+                "id": technique_id,
+                "name": technique_name,
+                "tactics": tactics,
+            })
+
+    return sorted(techniques, key=lambda x: x["id"])
 
 
-# Multithreading process to extract CAPEC entries for each CVE
-def process_capec(cve_capec_data, capec_list, cve_year):
+def process_capec(cve_capec_data: dict, capec_list: dict, techniques_db: dict, cve_year: str):
     with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(process_single_cve, cve, capec_list, cve_capec_data): cve for cve in tqdm(cve_capec_data, desc=f"Processing CAPEC to TECHNIQUES for CVE-{cve_year}", unit="CVE")}
+        futures = {
+            executor.submit(process_single_cve, cve, capec_list, techniques_db, cve_capec_data): cve
+            for cve in tqdm(cve_capec_data, desc=f"Processing CAPEC to TECHNIQUES for CVE-{cve_year}", unit="CVE")
+        }
         for future in as_completed(futures):
-            cve_result = future.result()
-            cve_capec_data[futures[future]]["TECHNIQUES"] = cve_result
+            cve = futures[future]
+            try:
+                cve_capec_data[cve]["TECHNIQUES"] = future.result()
+            except Exception as exc:
+                print(f"CVE {cve} generated an exception: {exc}")
+                cve_capec_data[cve]["TECHNIQUES"] = []
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2:
-        file = sys.argv[1]
-    else:
-        file = CVE_FILE
+    file = sys.argv[1] if len(sys.argv) == 2 else CVE_FILE
 
-    # Load the JSONL file
     cve_capec_data = {}
     with open(file, 'r') as f:
         for line in f:
@@ -840,17 +1063,17 @@ if __name__ == "__main__":
             cve_capec_data.update(cve_entry)
 
     if cve_capec_data:
-        # Load the CAPEC database
         with open(CAPEC_FILE, 'r') as f:
             capec_list = json.load(f)
 
+        with open(TECHNIQUES_FILE, 'r') as f:
+            techniques_db = json.load(f)
+
         cve_year = list(cve_capec_data.keys())[0].split('-')[1]
-        
-        process_capec(cve_capec_data, capec_list, cve_year)
+        process_capec(cve_capec_data, capec_list, techniques_db, cve_year)
         save_jsonl(cve_capec_data)
     else:
-        print("[-]No new vulnerabilities found")
-
+        print("[-] No new vulnerabilities found")
 ```
 
 ## File: update_capec_db.py
@@ -898,6 +1121,527 @@ if __name__ == "__main__":
 
 ```
 
+## File: cpe_index.py
+
+```py
+"""
+cpe_index.py
+------------
+Builds / updates a product-centric vulnerability history.
+
+Modes:
+  (no args)          Read from ALL database/CVE-*.jsonl  — full index rebuild
+  2023 2024          Read from specific year files only
+  --from-results     Read from results/new_cves.jsonl    — daily incremental update
+
+Output : database/products/{vendor}/{product}.jsonl
+         One line per CVE that affects that product, sorted chronologically.
+         Existing files are merged (never overwritten from scratch) so the
+         daily incremental mode is safe to run repeatedly.
+
+Record format:
+{
+  "cve": "CVE-2024-1234",
+  "version": "2.14.1",
+  "published": "...",
+  "lastModified": "...",
+  "description": "...",
+  "cvssScore": 9.8,
+  "cvsseSeverity": "CRITICAL",
+  "CWE": ["79"],
+  "CAPEC": ["86"],
+  "TECHNIQUES": [{"id": "T1059", "name": "...", "tactics": ["execution"]}],
+  "DEFEND": [{"id": "D3-...", "tactic": "...", "technique": "...", "artifact": "..."}]
+}
+"""
+
+import json
+import os
+import sys
+import glob
+from collections import defaultdict
+from tqdm import tqdm
+
+
+DATABASE_DIR = "database"
+PRODUCTS_DIR = os.path.join(DATABASE_DIR, "products")
+RESULTS_FILE = "results/new_cves.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Iterators
+# ---------------------------------------------------------------------------
+
+def iter_results_file():
+    """Yield (cve_id, data) from results/new_cves.jsonl."""
+    if not os.path.exists(RESULTS_FILE):
+        print(f"[-] Results file not found: {RESULTS_FILE}")
+        return
+    with open(RESULTS_FILE, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            for cve_id, data in entry.items():
+                yield cve_id, data
+
+
+def iter_cve_database(years: list[str] | None = None):
+    """Yield (cve_id, data) from database/CVE-{year}.jsonl files."""
+    pattern = os.path.join(DATABASE_DIR, "CVE-*.jsonl")
+    files = sorted(glob.glob(pattern))
+
+    if years:
+        files = [f for f in files if any(f"CVE-{y}.jsonl" in f for y in years)]
+
+    if not files:
+        print(f"[-] No database files found matching {pattern}")
+        return
+
+    for filepath in files:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                for cve_id, data in entry.items():
+                    yield cve_id, data
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def build_product_record(cve_id: str, version: str, data: dict) -> dict:
+    return {
+        "cve": cve_id,
+        "version": version,
+        "published": data.get("published", ""),
+        "lastModified": data.get("lastModified", ""),
+        "description": data.get("description", ""),
+        "cvssScore": data.get("cvssScore"),
+        "cvsseSeverity": data.get("cvsseSeverity"),
+        "CWE": data.get("CWE", []),
+        "CAPEC": data.get("CAPEC", []),
+        "TECHNIQUES": data.get("TECHNIQUES", []),
+        "DEFEND": data.get("DEFEND", []),
+    }
+
+
+def load_existing_product(vendor: str, product: str) -> dict[tuple, dict]:
+    """
+    Load an existing product JSONL into a dict keyed by (cve, version).
+    Used to merge new records without creating duplicates.
+    """
+    filepath = os.path.join(PRODUCTS_DIR, vendor, f"{product}.jsonl")
+    existing = {}
+    if not os.path.exists(filepath):
+        return existing
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            key = (record.get("cve"), record.get("version"))
+            existing[key] = record
+    return existing
+
+
+def write_product_file(vendor: str, product: str, records: dict[tuple, dict]):
+    """Write merged records for a vendor/product pair, sorted chronologically."""
+    product_dir = os.path.join(PRODUCTS_DIR, vendor)
+    os.makedirs(product_dir, exist_ok=True)
+    filepath = os.path.join(product_dir, f"{product}.jsonl")
+
+    sorted_records = sorted(
+        records.values(),
+        key=lambda r: r.get("published") or "9999"
+    )
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        for record in sorted_records:
+            f.write(json.dumps(record) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Core indexer
+# ---------------------------------------------------------------------------
+
+def build_index(source_iter, label: str):
+    """
+    Consume an iterator of (cve_id, data), group by (vendor, product),
+    merge with any existing product files, and write the result.
+    """
+    # Accumulate new records in memory: {(vendor, product): {(cve, version): record}}
+    new_by_product: dict[tuple, dict[tuple, dict]] = defaultdict(dict)
+    skipped = 0
+
+    print(f"[!] Reading CVE data from {label}...")
+    for cve_id, data in tqdm(source_iter, desc="Indexing CVEs", unit="CVE"):
+        cpe_entries = data.get("CPE", [])
+        if not cpe_entries:
+            skipped += 1
+            continue
+
+        for cpe in cpe_entries:
+            vendor = cpe.get("vendor", "").strip()
+            product = cpe.get("product", "").strip()
+            version = cpe.get("version", "N/A").strip()
+            if not vendor or not product:
+                continue
+            record = build_product_record(cve_id, version, data)
+            new_by_product[(vendor, product)][(cve_id, version)] = record
+
+    if skipped:
+        print(f"[!] Skipped {skipped} CVEs with no CPE data (run full rebuild to enrich these)")
+
+    if not new_by_product:
+        print("[-] No product data found — make sure the pipeline has run to completion.")
+        return
+
+    print(f"[!] Merging into product files for {len(new_by_product)} vendor/product pairs...")
+    for (vendor, product), new_records in tqdm(new_by_product.items(), desc="Writing", unit="product"):
+        existing = load_existing_product(vendor, product)
+        existing.update(new_records)  # new data wins
+        write_product_file(vendor, product, existing)
+
+    print(f"[+] Product index updated under {PRODUCTS_DIR}/")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    if "--from-results" in sys.argv:
+        # Daily incremental: only process today's results/new_cves.jsonl
+        build_index(iter_results_file(), label=RESULTS_FILE)
+    else:
+        # Full rebuild from database files, optionally filtered by year
+        years = [a for a in sys.argv[1:] if a.isdigit()]
+        label = f"database years: {', '.join(years)}" if years else "all database files"
+        build_index(iter_cve_database(years or None), label=label)
+```
+
+## File: rebuild_db.py
+
+```py
+"""
+rebuild_db.py
+-------------
+Full historical rebuild of the CVE database from scratch.
+
+What it does:
+  1. Fetches ALL CVEs from NVD since 1999-01-01 (when CVEs began) to today,
+     automatically chunking into 119-day windows to respect the API limit.
+  2. Processes each year's CVEs through the full pipeline:
+       CVE → CWE hierarchy → CAPEC → ATT&CK Techniques (with tactics) → D3FEND
+  3. Writes per-year database files:  database/CVE-{year}.jsonl
+  4. Builds the product-centric index: database/products/{vendor}/{product}.jsonl
+  5. Updates lastUpdate.txt to today so the daily job continues from here.
+
+Usage:
+    uv run python rebuild_db.py
+
+    # Start from a specific year (useful to resume a failed run):
+    uv run python rebuild_db.py --from 2010
+
+    # Only rebuild specific years (does not re-fetch; reprocesses existing data):
+    uv run python rebuild_db.py --years 2022 2023 2024
+
+Notes:
+  - The reference databases (CWE, CAPEC, ATT&CK, D3FEND) must already be
+    up to date before running this. Run the update_* scripts first.
+  - With an NVD API key (~50 req/30s) a full rebuild takes roughly 2-4 hours.
+  - Without an API key (~5 req/30s) expect 10-20 hours.
+  - The script is safe to interrupt and resume with --from <year>.
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+from tqdm import tqdm
+
+# Reuse all logic from the existing pipeline scripts
+from retrieve_cve import parse_cves, format_nvd_timestamp, MAX_WINDOW_DAYS
+from cve2cwe import process_cve_to_cwe, load_db as load_cwe_db
+from cwe2capec import process_cwe_to_capec, load_db as load_cwe_db_capec
+from capec2technique import process_capec
+from technique2defend import process_techniques
+
+UPDATE_FILE = "lastUpdate.txt"
+DATABASE_DIR = "database"
+RESULTS_FILE = "results/new_cves.jsonl"
+CAPEC_FILE = "resources/capec_db.json"
+TECHNIQUES_FILE = "resources/techniques_db.json"
+DEFEND_FILE = "resources/defend_db.jsonl"
+PRODUCTS_DIR = os.path.join(DATABASE_DIR, "products")
+
+# CVE programme started in 1999
+CVE_EPOCH = datetime(1999, 1, 1, tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def load_capec_db() -> dict:
+    with open(CAPEC_FILE, 'r') as f:
+        return json.load(f)
+
+
+def load_techniques_db() -> dict:
+    with open(TECHNIQUES_FILE, 'r') as f:
+        return json.load(f)
+
+
+def load_defend_db() -> dict:
+    defend_list = {}
+    with open(DEFEND_FILE, 'r') as f:
+        for line in f:
+            entry = json.loads(line.strip())
+            defend_list.update(entry)
+    return defend_list
+
+
+def group_by_year(cve_data: dict) -> dict[str, dict]:
+    """Split a flat {cve_id: data} dict into {year: {cve_id: data}}."""
+    by_year = defaultdict(dict)
+    for cve_id, data in cve_data.items():
+        year = cve_id.split('-')[1]
+        by_year[year][cve_id] = data
+    return dict(by_year)
+
+
+def save_year_jsonl(year: str, cve_data: dict):
+    """Merge new CVE data into the existing per-year database file."""
+    os.makedirs(DATABASE_DIR, exist_ok=True)
+    filepath = os.path.join(DATABASE_DIR, f"CVE-{year}.jsonl")
+
+    # Load existing records so we don't lose older entries
+    existing = {}
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    existing.update(entry)
+
+    existing.update(cve_data)  # new data wins (has CPE + full enrichment)
+
+    with open(filepath, 'w') as f:
+        for cve_id, data in existing.items():
+            f.write(json.dumps({cve_id: data}) + "\n")
+
+    return len(existing)
+
+
+def build_product_record(cve_id: str, version: str, data: dict) -> dict:
+    return {
+        "cve": cve_id,
+        "version": version,
+        "published": data.get("published", ""),
+        "lastModified": data.get("lastModified", ""),
+        "description": data.get("description", ""),
+        "cvssScore": data.get("cvssScore"),
+        "cvsseSeverity": data.get("cvsseSeverity"),
+        "CWE": data.get("CWE", []),
+        "CAPEC": data.get("CAPEC", []),
+        "TECHNIQUES": data.get("TECHNIQUES", []),
+        "DEFEND": data.get("DEFEND", []),
+    }
+
+
+def build_cpe_index_from(cve_data: dict):
+    """
+    Incrementally update the product index from a dict of enriched CVE records.
+    Loads existing product files, merges, and rewrites — so it's safe to call
+    repeatedly without duplicating entries.
+    """
+    # Group new records by (vendor, product)
+    new_by_product: dict[tuple, list] = defaultdict(list)
+
+    for cve_id, data in cve_data.items():
+        for cpe in data.get("CPE", []):
+            vendor = cpe.get("vendor", "").strip()
+            product = cpe.get("product", "").strip()
+            version = cpe.get("version", "N/A").strip()
+            if vendor and product:
+                new_by_product[(vendor, product)].append(
+                    build_product_record(cve_id, version, data)
+                )
+
+    for (vendor, product), new_records in new_by_product.items():
+        product_dir = os.path.join(PRODUCTS_DIR, vendor)
+        os.makedirs(product_dir, exist_ok=True)
+        filepath = os.path.join(product_dir, f"{product}.jsonl")
+
+        # Load existing records keyed by (cve, version)
+        existing: dict[tuple, dict] = {}
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        rec = json.loads(line)
+                        existing[(rec["cve"], rec["version"])] = rec
+
+        for rec in new_records:
+            existing[(rec["cve"], rec["version"])] = rec  # new wins
+
+        sorted_records = sorted(
+            existing.values(),
+            key=lambda r: r.get("published") or "9999"
+        )
+        with open(filepath, 'w') as f:
+            for rec in sorted_records:
+                f.write(json.dumps(rec) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline for a batch of CVEs
+# ---------------------------------------------------------------------------
+
+def run_pipeline(cve_data: dict, cwe_db: dict, capec_db: dict,
+                 techniques_db: dict, defend_db: dict, year: str) -> dict:
+    """
+    Run the full enrichment pipeline on a dict of CVE records.
+    Modifies cve_data in-place and returns it.
+    """
+    # Step 1: Walk CWE hierarchy
+    print(f"  [2/5] Walking CWE hierarchy...")
+    process_cve_to_cwe(cve_data, year, cwe_db)
+    # reload — process_cve_to_cwe saves to JSONL and we need the updated dict
+    with open(RESULTS_FILE, 'r') as f:
+        cve_data = {}
+        for line in f:
+            entry = json.loads(line.strip())
+            cve_data.update(entry)
+
+    # Step 2: CWE → CAPEC
+    print(f"  [3/5] Resolving CWEs to CAPEC...")
+    for cve_id in tqdm(cve_data, desc="  CWE→CAPEC", unit="CVE", leave=False):
+        cwe_list = cve_data[cve_id].get("CWE", [])
+        cve_data[cve_id]["CAPEC"] = process_cwe_to_capec(cwe_list, cwe_db)
+
+    # Step 3: CAPEC → ATT&CK Techniques (with tactics)
+    print(f"  [4/5] Mapping CAPEC to ATT&CK techniques...")
+    process_capec(cve_data, capec_db, techniques_db, year)
+
+    # Step 4: Techniques → D3FEND
+    print(f"  [5/5] Mapping techniques to D3FEND...")
+    process_techniques(cve_data, defend_db, year)
+
+    return cve_data
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Full historical CVE database rebuild")
+    parser.add_argument("--from", dest="from_year", type=int, default=None,
+                        help="Start from this year (e.g. 2010). Skips earlier years.")
+    parser.add_argument("--years", nargs="+", type=str, default=None,
+                        help="Only process these specific years (space-separated). "
+                             "Re-fetches and reprocesses from NVD.")
+    args = parser.parse_args()
+
+    today_dt = datetime.now(timezone.utc)
+
+    # Determine the start date for fetching
+    if args.from_year:
+        start_dt = datetime(args.from_year, 1, 1, tzinfo=timezone.utc)
+    else:
+        start_dt = CVE_EPOCH
+
+    print("=" * 60)
+    print("  CVE2CAPEC — Full Database Rebuild")
+    print("=" * 60)
+    print(f"  Start : {format_nvd_timestamp(start_dt)}")
+    print(f"  End   : {format_nvd_timestamp(today_dt)}")
+    print()
+
+    # Pre-load all reference databases once — they don't change during the run
+    print("[!] Loading reference databases...")
+    cwe_db = load_cwe_db()
+    capec_db = load_capec_db()
+    techniques_db = load_techniques_db()
+    defend_db = load_defend_db()
+    print(f"    CWE entries     : {len(cwe_db)}")
+    print(f"    CAPEC entries   : {len(capec_db)}")
+    print(f"    Technique entries: {len(techniques_db)}")
+    print(f"    D3FEND entries  : {len(defend_db)}")
+    print()
+
+    # --- Fetch phase ---
+    print("[!] Fetching CVEs from NVD (this will take a while)...")
+    all_cve_data = parse_cves(start_dt, today_dt)
+    print(f"\n[+] Total CVEs fetched: {len(all_cve_data)}")
+
+    if not all_cve_data:
+        print("[-] Nothing to process.")
+        sys.exit(0)
+
+    # Group by year so we can save incrementally
+    by_year = group_by_year(all_cve_data)
+    years_sorted = sorted(by_year.keys())
+
+    if args.years:
+        years_sorted = [y for y in years_sorted if y in args.years]
+
+    print(f"\n[!] Processing {len(years_sorted)} year(s): {', '.join(years_sorted)}\n")
+
+    os.makedirs("results", exist_ok=True)
+
+    for year in years_sorted:
+        cve_year_data = by_year[year]
+        print(f"\n{'='*50}")
+        print(f"  Year {year} — {len(cve_year_data)} CVEs")
+        print(f"{'='*50}")
+
+        # Write raw fetch output to results file (pipeline scripts read from here)
+        print(f"  [1/5] Saving raw CVE data...")
+        with open(RESULTS_FILE, 'w') as f:
+            for cve_id, data in cve_year_data.items():
+                f.write(json.dumps({cve_id: data}) + "\n")
+
+        # Run full enrichment pipeline
+        enriched = run_pipeline(
+            cve_year_data, cwe_db, capec_db, techniques_db, defend_db, year
+        )
+
+        # Persist to per-year database file
+        total = save_year_jsonl(year, enriched)
+        print(f"  [+] database/CVE-{year}.jsonl — {total} total records")
+
+        # Update product index incrementally
+        print(f"  [+] Updating product index...")
+        build_cpe_index_from(enriched)
+
+    # Update the last-run timestamp so the daily job picks up from today
+    with open(UPDATE_FILE, 'w') as f:
+        f.write(today_dt.isoformat())
+
+    print(f"\n{'='*60}")
+    print(f"  Rebuild complete!")
+    print(f"  lastUpdate.txt set to {today_dt.isoformat()}")
+    print(f"  Daily runs will now continue from this point.")
+    print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    main()
+```
+
 ## File: technique2defend.py
 
 ```py
@@ -912,25 +1656,20 @@ DEFEND_FILE = "resources/defend_db.jsonl"
 CVE_FILE = "results/new_cves.jsonl"
 
 
-# Update the database with the new CVEs and save the results to a JSONL file
-def save_jsonl(cve_tech_data):
-
-    # Write the results to a JSONL file
+def save_jsonl(cve_tech_data: dict):
+    """Write results to new_cves.jsonl and update per-year database files."""
     with open(CVE_FILE, 'w') as f:
         for cve, data in cve_tech_data.items():
             f.write(json.dumps({cve: data}) + "\n")
 
     new_cves = {}
-
     for cve, data in cve_tech_data.items():
         year = cve.split('-')[1]
         if year not in new_cves:
             new_cves[year] = {}
         new_cves[year][cve] = data
 
-
     for year, cves in new_cves.items():
-        # Update the database with the new CVEs
         cve_db = load_db_jsonl(year)
         cve_db.update(cves)
         with open(f'database/CVE-{year}.jsonl', 'w') as f:
@@ -938,8 +1677,7 @@ def save_jsonl(cve_tech_data):
                 f.write(json.dumps({cve: data}) + "\n")
 
 
-# Load the database from a JSONL file
-def load_db_jsonl(cve_year):
+def load_db_jsonl(cve_year: str) -> dict:
     cve_db = {}
     try:
         with open(f'database/CVE-{cve_year}.jsonl', 'r') as f:
@@ -951,34 +1689,47 @@ def load_db_jsonl(cve_year):
     return cve_db
 
 
-# Process CVE to extract the related CAPEC entries
-def process_single_cve(cve, defend_list, cve_tech_data):
+def process_single_cve(cve: str, defend_list: dict, cve_tech_data: dict) -> list[dict]:
+    """
+    Resolve D3FEND entries for each ATT&CK technique linked to a CVE.
+    TECHNIQUES is now a list of dicts: [{id, name, tactics}, ...]
+    Returns a deduplicated list of D3FEND dicts: [{id, tactic, technique, artifact}]
+    """
     defends = []
-    for techniques in cve_tech_data[cve]["TECHNIQUES"]:
-        lines = defend_list.get("T"+techniques, {})
-        if lines:
-            # Ajoute les dict de lines dans la liste
-            for line in lines:
-                defends.append(line)
+    seen = set()
+
+    for tech in cve_tech_data[cve].get("TECHNIQUES", []):
+        # Support both old format (plain string) and new format (dict)
+        technique_id = tech["id"] if isinstance(tech, dict) else tech
+        defend_key = "T" + technique_id
+
+        for entry in defend_list.get(defend_key, []):
+            dedup_key = (entry.get("id"), entry.get("artifact"))
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                defends.append(entry)
+
     return defends
 
 
-# Multithreading process to extract CAPEC entries for each CVE
-def process_techniques(cve_tech_data, defend_list, cve_year):
+def process_techniques(cve_tech_data: dict, defend_list: dict, cve_year: str):
     with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(process_single_cve, cve, defend_list, cve_tech_data): cve for cve in tqdm(cve_tech_data, desc=f"Processing TECHNIQUES to DEFEND for CVE-{cve_year}", unit="CVE")}
+        futures = {
+            executor.submit(process_single_cve, cve, defend_list, cve_tech_data): cve
+            for cve in tqdm(cve_tech_data, desc=f"Processing TECHNIQUES to DEFEND for CVE-{cve_year}", unit="CVE")
+        }
         for future in as_completed(futures):
-            cve_result = future.result()
-            cve_tech_data[futures[future]]["DEFEND"] = cve_result
+            cve = futures[future]
+            try:
+                cve_tech_data[cve]["DEFEND"] = future.result()
+            except Exception as exc:
+                print(f"CVE {cve} generated an exception: {exc}")
+                cve_tech_data[cve]["DEFEND"] = []
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2:
-        file = sys.argv[1]
-    else:
-        file = CVE_FILE
+    file = sys.argv[1] if len(sys.argv) == 2 else CVE_FILE
 
-    # Load the JSONL file
     cve_tech_data = {}
     with open(file, 'r') as f:
         for line in f:
@@ -986,7 +1737,6 @@ if __name__ == "__main__":
             cve_tech_data.update(cve_entry)
 
     if cve_tech_data:
-
         defend_list = {}
         with open(DEFEND_FILE, 'r') as f:
             for line in f:
@@ -994,12 +1744,10 @@ if __name__ == "__main__":
                 defend_list.update(defend_entry)
 
         cve_year = list(cve_tech_data.keys())[0].split('-')[1]
-
         process_techniques(cve_tech_data, defend_list, cve_year)
         save_jsonl(cve_tech_data)
     else:
-        print("[-]No new vulnerabilities found")
- 
+        print("[-] No new vulnerabilities found")
 ```
 
 ## File: docs/mitre/README.md
