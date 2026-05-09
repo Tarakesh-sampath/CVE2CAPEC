@@ -1,3 +1,8 @@
 .vscode
 venv
 results/new_cves.jsonl
+
+__pycache__/
+
+RAW
+.env

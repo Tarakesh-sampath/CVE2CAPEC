@@ -5,28 +5,24 @@ from tqdm import tqdm
 
 
 CAPEC_FILE = "resources/capec_db.json"
+TECHNIQUES_FILE = "resources/techniques_db.json"
 CVE_FILE = "results/new_cves.jsonl"
 
 
-# Update the database with the new CVEs and save the results to a JSONL file
-def save_jsonl(cve_capec_data):
-    
-    # Write the results to a JSONL file
+def save_jsonl(cve_capec_data: dict):
+    """Write results to new_cves.jsonl and update per-year database files."""
     with open(CVE_FILE, 'w') as f:
         for cve, data in cve_capec_data.items():
             f.write(json.dumps({cve: data}) + "\n")
 
     new_cves = {}
-
     for cve, data in cve_capec_data.items():
         year = cve.split('-')[1]
         if year not in new_cves:
             new_cves[year] = {}
         new_cves[year][cve] = data
 
-
     for year, cves in new_cves.items():
-        # Update the database with the new CVEs
         cve_db = load_db_jsonl(year)
         cve_db.update(cves)
         with open(f'database/CVE-{year}.jsonl', 'w') as f:
@@ -34,8 +30,7 @@ def save_jsonl(cve_capec_data):
                 f.write(json.dumps({cve: data}) + "\n")
 
 
-# Load the database from a JSONL file
-def load_db_jsonl(cve_year):
+def load_db_jsonl(cve_year: str) -> dict:
     cve_db = {}
     try:
         with open(f'database/CVE-{cve_year}.jsonl', 'r') as f:
@@ -47,36 +42,64 @@ def load_db_jsonl(cve_year):
     return cve_db
 
 
-# Process CVE to extract the related CAPEC entries
-def process_single_cve(cve, capec_list, cve_capec_data):
-    technics = set()
-    for capec in cve_capec_data[cve]["CAPEC"]:
-        lines = capec_list.get(capec, {}).get("techniques", "")
-        if lines:
-            entries = lines.split("NAME:ATTACK:ENTRY ")[1:]
-            for entry in entries:
-                infos = entry.split(":")
-                id = infos[1]
-                technics.add(id)
-    return list(sorted(technics))
+def process_single_cve(cve: str, capec_list: dict, techniques_db: dict, cve_capec_data: dict) -> list[dict]:
+    """
+    For a single CVE, resolve its CAPEC entries to ATT&CK techniques.
+    Returns a list of dicts:
+        [{"id": "T1059", "name": "...", "tactics": ["execution", ...]}, ...]
+    Deduplicates by technique ID.
+    """
+    seen_ids = set()
+    techniques = []
+
+    for capec_id in cve_capec_data[cve].get("CAPEC", []):
+        capec_entry = capec_list.get(capec_id, {})
+        raw_mappings = capec_entry.get("techniques", "")
+        if not raw_mappings:
+            continue
+
+        # The stored format is: "NAME:ATTACK:ENTRY <id>:<name>: ..."
+        entries = raw_mappings.split("NAME:ATTACK:ENTRY ")[1:]
+        for entry in entries:
+            infos = entry.split(":")
+            technique_id = infos[1] if len(infos) > 1 else ""
+            technique_name = infos[2].strip() if len(infos) > 2 else ""
+
+            if not technique_id or technique_id in seen_ids:
+                continue
+            seen_ids.add(technique_id)
+
+            # Pull tactic(s) from the techniques_db
+            tech_meta = techniques_db.get(technique_id, {})
+            tactics = tech_meta.get("tactics", [])
+
+            techniques.append({
+                "id": technique_id,
+                "name": technique_name,
+                "tactics": tactics,
+            })
+
+    return sorted(techniques, key=lambda x: x["id"])
 
 
-# Multithreading process to extract CAPEC entries for each CVE
-def process_capec(cve_capec_data, capec_list, cve_year):
+def process_capec(cve_capec_data: dict, capec_list: dict, techniques_db: dict, cve_year: str):
     with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(process_single_cve, cve, capec_list, cve_capec_data): cve for cve in tqdm(cve_capec_data, desc=f"Processing CAPEC to TECHNIQUES for CVE-{cve_year}", unit="CVE")}
+        futures = {
+            executor.submit(process_single_cve, cve, capec_list, techniques_db, cve_capec_data): cve
+            for cve in tqdm(cve_capec_data, desc=f"Processing CAPEC to TECHNIQUES for CVE-{cve_year}", unit="CVE")
+        }
         for future in as_completed(futures):
-            cve_result = future.result()
-            cve_capec_data[futures[future]]["TECHNIQUES"] = cve_result
+            cve = futures[future]
+            try:
+                cve_capec_data[cve]["TECHNIQUES"] = future.result()
+            except Exception as exc:
+                print(f"CVE {cve} generated an exception: {exc}")
+                cve_capec_data[cve]["TECHNIQUES"] = []
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2:
-        file = sys.argv[1]
-    else:
-        file = CVE_FILE
+    file = sys.argv[1] if len(sys.argv) == 2 else CVE_FILE
 
-    # Load the JSONL file
     cve_capec_data = {}
     with open(file, 'r') as f:
         for line in f:
@@ -84,13 +107,14 @@ if __name__ == "__main__":
             cve_capec_data.update(cve_entry)
 
     if cve_capec_data:
-        # Load the CAPEC database
         with open(CAPEC_FILE, 'r') as f:
             capec_list = json.load(f)
 
+        with open(TECHNIQUES_FILE, 'r') as f:
+            techniques_db = json.load(f)
+
         cve_year = list(cve_capec_data.keys())[0].split('-')[1]
-        
-        process_capec(cve_capec_data, capec_list, cve_year)
+        process_capec(cve_capec_data, capec_list, techniques_db, cve_year)
         save_jsonl(cve_capec_data)
     else:
-        print("[-]No new vulnerabilities found")
+        print("[-] No new vulnerabilities found")

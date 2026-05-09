@@ -5,6 +5,9 @@ from tqdm import tqdm
 from re import match
 import os
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_CVES = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
 API_KEY = os.environ.get("NVD_API_KEY")
