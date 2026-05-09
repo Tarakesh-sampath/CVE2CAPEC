@@ -154,6 +154,9 @@ jobs:
       - name: Retrieve TECHNIQUES
         run: python capec2technique.py
 
+      - name: Index CPE
+        run: python cpe_index.py --from-results
+
       - name: Commit and push database updates
         run: |
           git config --global user.name "github-actions"
