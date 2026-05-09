@@ -28,9 +28,9 @@ def get_parent_cwe(cwe: str, cwe_db: dict):
 def process_cve_to_cwe(cve_cwe_data, cve_year, cwe_db):
     cwe_list = {}
 
-    def process_single_cve(cve, cwe_db):
+    def process_single_cve(cve, cwe_db, original_data):
         cwe_set = set()  # Use a set to avoid duplicates
-        for cwe in cve_cwe_data[cve]['CWE']:
+        for cwe in original_data[cve]['CWE']:
             cwe_set.add(cwe)
             child_cwe = get_parent_cwe(cwe, cwe_db)
             
@@ -46,11 +46,11 @@ def process_cve_to_cwe(cve_cwe_data, cve_year, cwe_db):
                         # Add new children to the queue
                         queue.extend(new_children)
 
-        return {cve: {"CWE": list(sorted(cwe_set))}}
+        return {cve: {**original_data[cve], "CWE": list(sorted(cwe_set))}}
 
     # Process each CVE concurrently
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {executor.submit(process_single_cve, cve, cwe_db): cve for cve in cve_cwe_data}
+        futures = {executor.submit(process_single_cve, cve, cwe_db, cve_cwe_data): cve for cve in cve_cwe_data}
         for future in tqdm(as_completed(futures), total=len(futures), desc=f"Processing CVEs for CVE-{cve_year}", unit="CVE"):
             cve = futures[future]
             try:

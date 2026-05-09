@@ -70,7 +70,7 @@ if __name__ == "__main__":
         cve_capec_data = {}
         for cve in tqdm(cve_cwe_data, desc=f"Processing CWE to CAPEC for CVE-{cve_year}", unit="CVE"):
             cwe_list = cve_cwe_data[cve]["CWE"]
-            cve_capec_data[cve] = {"CWE": cwe_list}
+            cve_capec_data[cve] = {**cve_cwe_data[cve]}
             cve_capec_data[cve]["CAPEC"] = process_cwe_to_capec(cwe_list, cwe_db)
 
         save_jsonl(cve_capec_data)
