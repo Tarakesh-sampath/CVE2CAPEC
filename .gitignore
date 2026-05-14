@@ -7,4 +7,4 @@ __pycache__/
 RAW
 .env
 
-database_backup/
+backup/
