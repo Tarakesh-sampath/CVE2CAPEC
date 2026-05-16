@@ -8,3 +8,4 @@ RAW
 .env
 
 backup/
+#results/
